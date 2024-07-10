@@ -1,6 +1,19 @@
 cmake_minimum_required(VERSION 3.20.0)
-find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(posey_hub)
 
-FILE(GLOB app_sources src/*.c)
-target_sources(app PRIVATE ${app_sources})
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CONFIG_LIB_CPLUSPLUS ON)
+set(CONFIG_NEWLIB_LIBC ON)
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(posey-hub-firmware)
+
+file(GLOB_RECURSE SRCS_CPP ${CMAKE_SOURCE_DIR}/src/*.cpp)
+file(GLOB_RECURSE SRCS_C ${CMAKE_SOURCE_DIR}/src/*.c)
+target_sources(app PRIVATE ${SRCS_CPP} ${SRCS_C})
+target_include_directories(app PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/posey-lib)
+
+zephyr_library_include_directories(.)
