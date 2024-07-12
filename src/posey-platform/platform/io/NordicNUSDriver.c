@@ -17,6 +17,8 @@
 #include <bluetooth/services/nus.h>
 #include <bluetooth/services/nus_client.h>
 
+// // Add the MDS header
+// #include <bluetooth/services/mds.h>
 // #include <memfault/metrics/metrics.h>
 // #include <memfault/core/trace_event.h>
 
@@ -103,11 +105,10 @@ static struct bt_conn* scan_conn = NULL;
 
 static struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN)};
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL)};
 
 static const struct bt_data sd[] = {
-    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
-};
+    BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN)};
 
 static uint8_t slot_from_conn(struct bt_conn* const conn) {
     if (conn == NULL)
@@ -118,7 +119,7 @@ static uint8_t slot_from_conn(struct bt_conn* const conn) {
             return i;
     }
 
-    return -1;
+    return 0x65;
 }
 
 static int slot_from_name(const char* const name) {
@@ -247,30 +248,7 @@ static void scan_stop();
 
 static bool sensors_enabled = true;
 
-void disable_sensors() {
-    LOG_WRN("Disabling sensors");
-    sensors_enabled = false;
-
-    // Restart scanning in passive mode.
-    scan_start();
-
-    // Disconnect any connected sensor devices.
-    for (int i = 0; i < MaxSensors; ++i) {
-        if (connections[i] != NULL) {
-            LOG_WRN("Disconnecting sensor %d %s", i, names[i]);
-            bt_conn_disconnect(
-                connections[i], BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        }
-    }
-}
-
-void enable_sensors() {
-    LOG_WRN("Enabling sensors");
-    sensors_enabled = true;
-
-    // Restart scanning in active mode.
-    scan_start();
-}
+static K_WORK_DEFINE(start_advertising_worker, scan_start);
 
 static void discovery_complete(struct bt_gatt_dm* dm, void* context) {
     struct bt_nus_client* nus = (struct bt_nus_client*)context;
@@ -283,7 +261,7 @@ static void discovery_complete(struct bt_gatt_dm* dm, void* context) {
 
     bt_gatt_dm_data_release(dm);
 
-    scan_start();
+    k_work_submit(&start_advertising_worker);
 }
 
 static void discovery_service_not_found(struct bt_conn* conn, void* context) {
@@ -331,7 +309,7 @@ static void scan_filter_match(
 
 static void scan_connecting_error(struct bt_scan_device_info* device_info) {
     LOG_WRN("Scan connecting failed");
-    scan_start();
+    k_work_submit(&start_advertising_worker);
 }
 
 static void scan_connecting(
@@ -484,7 +462,7 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
             connections[slot] = NULL;
         }
 
-        scan_start();
+        k_work_submit(&start_advertising_worker);
 
         return;
     }
@@ -603,9 +581,7 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
     LOG_INF("%d of %d sensors connected.", sensor_connections, MaxSensors);
 
     // Restart active scanning if necessary.
-    err = scan_start();
-    if (err)
-        LOG_ERR("Scanning failed to start (err %d - %s)", err, strerror(err));
+    k_work_submit(&start_advertising_worker);
 }
 
 static bool le_param_req(struct bt_conn* conn, struct bt_le_conn_param* param) {
@@ -705,7 +681,7 @@ static uint8_t bt_nus_sensor_received(
     bt_addr_le_to_str(bt_conn_get_dst(nus->conn), addr, ARRAY_SIZE(addr));
     const uint8_t slot = slot_from_conn(nus->conn);
     const char* name = "Unknown";
-    if (slot < MaxSensors) {
+    if (slot < MaxConnections) {
         name = names[slot];
         uint32_t now = k_cyc_to_ms_floor32(sys_clock_tick_get_32());
         float dt = (now - last_update[slot]) / 1.0e3;
@@ -719,6 +695,8 @@ static uint8_t bt_nus_sensor_received(
             last_update[slot] = now;
             throughput[slot] = 0;
         }
+    } else {
+        LOG_INF("Received %d bytes from an unknown device: %s.", len, addr);
     }
 
     LOG_DBG(
@@ -806,12 +784,14 @@ int init_nus() {
         settings_load();
     }
 
+    LOG_INF("Initializing BT scanning...");
     err = scan_init();
     if (err) {
         LOG_ERR("Error scan_init: %d", err);
         return err;
     }
 
+    LOG_INF("Initializing NUS client connection callbacks...");
     err = nus_client_init();
     if (err) {
         LOG_ERR(
@@ -829,6 +809,19 @@ int init_nus() {
 
     // bt_set_name(device_config.name);
 
+    // LOG_INF("Initializing memfault...");
+    // const struct bt_mds_cb mds_cb = {
+    //     .access_enable = NULL,
+    // };
+    // err = bt_mds_cb_register(&mds_cb);
+    // if (err) {
+    //     LOG_ERR(
+    //         "Memfault Diagnostic service callback registration failed (err "
+    //         "%d)\n",
+    //         err);
+    //     return err;
+    // }
+
     LOG_INF("Sleeping before starting BLE advertising...");
     k_sleep(K_MSEC(1000));
 
@@ -840,11 +833,7 @@ int init_nus() {
         return err;
     }
 
-    err = scan_start();
-    if (err) {
-        LOG_ERR("Scanning failed to start (err %d)", err);
-        return err;
-    }
+    k_work_submit(&start_advertising_worker);
 
     LOG_INF("Scanning successfully started");
 
@@ -860,14 +849,4 @@ void close_connections() {
             connections[i] = NULL;
         }
     }
-}
-
-void disable_scanning() {
-    scanning_enabled = false;
-    scan_stop();
-}
-
-void enable_scanning() {
-    scanning_enabled = true;
-    scan_start();
 }
